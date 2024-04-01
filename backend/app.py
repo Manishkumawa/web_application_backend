@@ -1,0 +1,429 @@
+from flask import Flask, request, jsonify,url_for,redirect,session,render_template
+from pymongo import MongoClient
+from flask_jwt_extended import create_access_token ,jwt_required ,create_refresh_token ,JWTManager,get_jwt_identity
+from werkzeug.security import generate_password_hash, check_password_hash
+from flask_cors import CORS,cross_origin
+from flask_dance.contrib.google import make_google_blueprint, google
+from msal import ConfidentialClientApplication
+import os
+from flask_session import Session
+import identity
+import identity.web
+import requests
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+from pathlib import Path
+import json
+import urllib
+import msal
+import random
+import string 
+import base64
+
+app = Flask(__name__)
+CORS(app, origins="*", supports_credentials=True)
+
+os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
+app.secret_key = os.urandom(12)
+app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY')
+app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=1)
+app.config["JWT_REFRESH_TOKEN_EXPIRES"] = timedelta(days=30)
+jwt = JWTManager(app)
+
+
+client = MongoClient(os.getenv('MONGODB_URL'))
+db = client['AI_database']
+
+# google login 
+app.config["GOOGLE_OAUTH_CLIENT_ID"] = os.getenv('GOOGLE_OAUTH_CLIENT_ID')
+app.config["GOOGLE_OAUTH_CLIENT_SECRET"] = os.getenv('GOOGLE_OAUTH_CLIENT_SECRET')
+
+google_blueprint = make_google_blueprint(
+    client_id=os.getenv('GOOGLE_OAUTH_CLIENT_ID'),
+    client_secret=os.getenv('GOOGLE_OAUTH_CLIENT_SECRET'),
+    scope=["https://www.googleapis.com/auth/userinfo.email", "https://www.googleapis.com/auth/userinfo.profile", "openid"]
+)
+app.register_blueprint(google_blueprint, url_prefix="/login")
+
+@app.route("/")
+def index():
+    if not google.authorized:
+        return redirect(url_for("google.login"))
+    return redirect(url_for("google_callback"))
+
+@app.route("/callback")
+def google_callback():
+    if not google.authorized:
+        return jsonify({"error": "Failed to log in."}),400
+    resp = google.get("/oauth2/v1/userinfo")
+    assert resp.ok, resp.text
+
+    user_info = resp.json()
+    exist_user = db.users.find_one({'email':user_info['email']},{'first_name':1})
+
+    if not exist_user:
+        db.users.insert_one({'first_name':user_info['given_name'] ,'last_name': user_info['family_name'],'email':user_info['email']})
+
+    token = create_access_token(identity=user_info['email'])
+    
+    user_info['access_token'] = token
+    
+    user_info_str = urllib.parse.quote(json.dumps(user_info))
+    
+    return redirect(f"{os.getenv('FRONTEND_URL')}/login?data={user_info_str}", code=302)
+
+# Microsoft Login
+app.config["MICROSOFT_OAUTH_CLIENT_ID"] = os.getenv('MICROSOFT_OAUTH_CLIENT_ID')
+app.config["MICROSOFT_OAUTH_CLIENT_SECRET"] = os.getenv('MICROSOFT_OAUTH_CLIENT_SECRET')
+app.config["MICROSOFT_OAUTH_REDIRECT_URI"] = os.getenv('MICROSOFT_OAUTH_REDIRECT_URI')
+
+@app.route("/login/microsoft")
+def microsoft_login():
+    msal_app = ConfidentialClientApplication(
+        app.config["MICROSOFT_OAUTH_CLIENT_ID"],
+        authority="https://login.microsoftonline.com/consumers",
+        client_credential=app.config["MICROSOFT_OAUTH_CLIENT_SECRET"]
+    )
+    auth_url = msal_app.get_authorization_request_url(
+        scopes=["User.Read"],
+        state=os.urandom(16),
+        redirect_uri=app.config["MICROSOFT_OAUTH_REDIRECT_URI"]
+    )
+    return redirect(auth_url)
+
+from flask import redirect, jsonify, request, url_for
+import urllib.parse
+
+@app.route("/microsoft/callback")
+def microsoft_callback():
+    code = request.args.get('code')
+    if not code:
+        return jsonify({"error": "Failed to log in."}), 400
+
+    msal_app = ConfidentialClientApplication(
+        app.config["MICROSOFT_OAUTH_CLIENT_ID"],
+        authority="https://login.microsoftonline.com/consumers",
+        client_credential=app.config["MICROSOFT_OAUTH_CLIENT_SECRET"]
+    )
+    result = msal_app.acquire_token_by_authorization_code(
+        code,
+        scopes=["User.Read"],
+        redirect_uri=app.config["MICROSOFT_OAUTH_REDIRECT_URI"]
+    )
+
+    if "error" in result:
+        return jsonify({"error": "Failed to log in.", "details": result["error_description"]}), 400
+
+    if "access_token" in result:
+        headers = {'Authorization': 'Bearer ' + result['access_token']}
+        graph_data = requests.get("https://graph.microsoft.com/v1.0/me", headers=headers).json()
+
+        exist_user = db.users.find_one({'email': graph_data["mail"]}, {'first_name': 1})
+
+        if not exist_user:
+            user_data = {
+                'first_name': graph_data.get("givenName", ""),
+                'last_name': graph_data.get("surname", ""),
+                'email': graph_data.get("mail", ""),
+                'phone': graph_data.get("mobilePhone", "")
+            }
+            db.users.insert_one(user_data)
+        else:
+            db.users.update_one({'email': graph_data["mail"]}, {'$set': {'phone': graph_data.get("mobilePhone", "")}})
+
+        user_info = {
+            'first_name': graph_data.get("givenName", ""),
+            'last_name': graph_data.get("surname", ""),
+            'email': graph_data.get("mail", ""),
+            'phone': graph_data.get("mobilePhone", "")
+        }
+
+        token = create_access_token(identity=user_info['email'])
+
+        user_info['access_token'] = token
+
+        user_info_str = urllib.parse.quote(json.dumps(user_info))
+
+        frontend_url = os.getenv('FRONTEND_URL') + "/login?data=" + user_info_str
+        return redirect(frontend_url, code=302)
+    else:
+        return jsonify({"error": "Failed to log in."}), 400
+
+# Manual Authentication
+@app.route('/auth/signup', methods =['POST'])
+def register():
+    
+    first_name = request.json.get('first_name')
+    last_name = request.json.get('last_name')
+    country_code = request.json.get('country_code')
+    phone = request.json.get('phone')
+    email = request.json.get('email')
+    password = request.json.get('password')
+
+    if not (first_name and last_name and country_code and phone and email and password):
+        return jsonify({'message': 'Missing required fields'}), 400
+    if db.users.find_one({'email': email}):
+        return jsonify({'message': 'User already exists'}), 400
+
+    hashed_password = generate_password_hash(password)
+    chef_id = "AiChef"+ first_name.upper() + "-" + str(random.randint(1000,10000))
+    db.users.insert_one({
+        'first_name': first_name,
+        'last_name': last_name,
+        'country_code': country_code,
+        'phone': phone,
+        'email': email,
+        'password': hashed_password,
+        'chef_id':chef_id
+    })
+    
+    return jsonify({'message': 'User registered successfully'}), 201
+
+@app.route('/auth/login', methods=['POST'])
+def loginAuth():
+    
+    email = request.json['email']
+    password = request.json['password']
+   
+    user = db.users.find_one({'email': email})
+    if not user or not check_password_hash(user['password'], password):
+        return jsonify({'message': 'Invalid credentials'}), 401
+    else:
+        token  = create_access_token(identity= email)
+
+    name = user['first_name']+" "+user['last_name']
+    return jsonify(message = 'Login Successful', access_token = token, email = email, name = name)
+
+@app.route('/auth/forgetPassword',methods =['POST'])
+def forgetP():
+
+    email = request.json.get('email')
+    newPassword = request.json.get('newPassword')
+
+    db.users.update_one({ "email": email },{"$set": { "password": generate_password_hash(newPassword) }})
+    return jsonify({'message':"password updates succesfully"})
+
+@app.route('/logoutAPP', methods=['POST'])
+def logoutAPP():
+    # TODO: Implement logout logic
+    # This route could be a placeholder if you're using token-based authentication.
+    # If you're using sessions, you would typically handle logout on the client-side by clearing the session.
+
+    return jsonify({'message': 'Logout successful'}), 200
+
+
+@app.route('/api/dishCreateProcess',methods = ['POST','GET'])
+def  dishCreateProcess():
+    data = request.get_json()
+    dishN = data['dish_name']
+    people = data['people']
+    Dish_detail = db.Dish.find_one({'dish_name':dishN})
+    #already_person = #Dish_detail['person'] 
+    already_person = 1 
+    if Dish_detail is None:
+        return jsonify({'Message':"Dish is not Found"}),404
+    else:   
+        Inde =[]
+        for it in Dish_detail['indegrients']:
+            temp = it['name'] +" " +str((int(it['quantity'])//(already_person))*people) +"-" +it['unit']
+            Inde.append(temp)
+            #Inde.append(it['name'])
+            #Inde.append(str(int(it['quantity'])//(already_person))*people) +" " + it['unit'])
+        return jsonify({"Kitchen_equi":Dish_detail['kitchen_equipments'].split(","),"Indegrients":Inde}),201
+
+@app.route('/api/luxuryDishes/',methods =['GET','POST'])
+def luxuryDishes():
+    data = request.get_json()
+    dishN = data['dish_name']
+    people = data['people']
+    Dish_detail = db.Dish.find_one({'dish_name':dishN})
+    #already_person = #Dish_detail['person'] 
+    already_person = 1 
+    if Dish_detail is None:
+        return jsonify({'Message':"Dish is not Found"}),404
+    else:   
+        Inde =[]
+        for it in Dish_detail['indegrients']:
+            temp = it['name'] +" " + str((int(it['quantity'])//(already_person))*people) +"-" +it['unit']
+            Inde.append(temp)
+            #Inde.append(it['name'])
+            #Inde.append(str(int(it['quantity'])//(already_person))*people) +" " + it['unit'])
+        return jsonify({"Kitchen_equi":Dish_detail['kitchen_equipments'].split(","),"Indegrients":Inde}),201
+
+@app.route('/api/quickDishes',methods =['POST','GET'])
+def quickDishes():
+    data = request.get_json()
+    dishN = data['dish_name']
+    people = data['people']
+    Dish_detail = db.Dish.find_one({'dish_name':dishN})
+    #already_person = #Dish_detail['person'] 
+    already_person = 1 
+    if Dish_detail is None:
+        return jsonify({'Message':"Dish is not Found"}),404
+    else:   
+        Inde =[]
+        for it in Dish_detail['indegrients']:
+            temp = it['name'] +" " + str((int(it['quantity'])//(already_person))*people) +"-" +it['unit']
+            Inde.append(temp)
+            #Inde.append(it['name'])
+            #Inde.append(str(int(it['quantity'])//(already_person))*people) +" " + it['unit'])
+        return jsonify({"Kitchen_equi":Dish_detail['kitchen_equipments'].split(","),"Indegrients":Inde}),201
+    
+
+@app.route('/api/healtyDishes',methods =['POST','GET'])
+def healtyDishes():
+    data = request.get_json()
+    dishN = data['dish_name']
+    people = data['people']
+    Dish_detail = db.Dish.find_one({'dish_name':dishN})
+    #already_person = #Dish_detail['person'] 
+    already_person = 1 
+    if Dish_detail is None:
+        return jsonify({'Message':"Dish is not Found"}),404
+    else:   
+        Inde =[]
+        for it in Dish_detail['indegrients']:
+            temp = it['name'] +" " + str((int(it['quantity'])//(already_person))*people) +"-" +it['unit']
+            Inde.append(temp)
+            #Inde.append(it['name'])
+            #Inde.append(str(int(it['quantity'])//(already_person))*people) +" " + it['unit'])
+        return jsonify({"Kitchen_equi":Dish_detail['kitchen_equipments'].split(","),"Indegrients":Inde}),201
+    
+
+
+
+@app.route('/userDetials',methods =['GET','POST'])
+@jwt_required()
+def  userDetials():
+    temp = get_jwt_identity()
+    UserData = db.users.find_one({'email':temp})
+    first_name = UserData['first_name']
+    last_name =UserData['last_name']
+    email = UserData['email']
+
+    name = first_name +" " +last_name
+
+    data = request.get_json()
+    country = data['country']
+    state = data['state']
+    dish_type = data['Dish_category']
+    
+
+    db.AllDetails.insert_one({'name':name,'email':email,'country':country,'state':state ,'dish_type':dish_type })
+
+
+    return jsonify({"message":"User details saved successfully"}),201 
+
+
+
+@app.route('/api/chef_id',methods =['POST','GET'])
+@jwt_required()
+def create_id():
+
+    user_email = get_jwt_identity()
+    user = db.users.find_one({'email':user_email})
+
+    chef_id = "AiChef"+user['first_name']+ str(random.randint(1000,10000))
+    print(chef_id)
+
+    db.users.update_one({'email':user_email},{"$set" :{"chef_id":chef_id}})
+
+    return jsonify({"message":"chef id created succesffuly"}),200
+
+
+# pipeline of data
+redirect_uri = 'http://localhost:3000/callback'
+
+def generate_random_string(length):
+    
+    rand_Str = string.ascii_letters + string.digits
+    return ''.join(random.choice(rand_Str) for _ in range(length))
+
+@app.route('/login')
+def login():
+    state = generate_random_string(16)
+    scope = 'user-read-private user-read-email user-read-recently-played playlist-read-private playlist-read-private user-top-read user-library-read user-follow-read'
+    params = {
+        'response_type': '',
+        'client_id': '',
+        'scope': scope,
+        'redirect_uri': '',
+        'state': ''
+    }
+    redirect_url = 'https://accounts.spotify.com/authorize?' + urllib.parse.urlencode(params)
+    return redirect(redirect_url)
+
+@app.route('/callback')
+def callback():
+    code = request.args.get('code', None)
+    state = request.args.get('state', None)
+
+    if state is None:
+        return jsonify({'error': 'state_mismatch'}), 400
+    else:
+        auth_options = {
+            'url': 'https://accounts.spotify.com/api/token',
+            'data': {
+                'code': code,
+                'redirect_uri': redirect_uri,
+                'grant_type': 'authorization_code'
+            },
+            'headers': {
+                'content-type': 'application/x-www-form-urlencoded',
+                'Authorization': 'Basic ' + base64.b64encode(f'{os.getenv('CLIENT_ID')}:{os.getenv('CLIENT_SECRET')}'.encode('utf-8')).decode('utf-8')
+            }
+        }
+
+        response = requests.post(auth_options['url'], data=auth_options['data'], headers=auth_options['headers'])
+        token_info = response.json()
+        
+        # Store the token_info for further analysis
+        with open('token_info.json', 'w') as json_file:
+            json_file.write(json.dumps(token_info, indent=4))
+        
+        # Return a response
+        return jsonify({'message': 'Authentication successful'})
+
+@app.route('/refresh_token')
+def refresh_token():
+    refresh_token = request.args.get('refresh_token', None)
+
+    if refresh_token is None:
+        return jsonify({'error': 'missing_refresh_token'}), 400
+
+    auth_options = {
+        'url': 'https://accounts.spotify.com/api/token',
+        'data': {
+            'grant_type': 'refresh_token',
+            'refresh_token': refresh_token
+        },
+        'headers': {
+            'content-type': 'application/x-www-form-urlencoded',
+            'Authorization': 'Basic ' + base64.b64encode(f'{os.getenv('CLIENT_ID')}:{os.getenv('CLIENT_SECRET')}'.encode('utf-8')).decode('utf-8')
+        }
+    }
+
+    response = requests.post(auth_options['url'], data=auth_options['data'], headers=auth_options['headers'])
+    token_info = response.json()
+    # Write the modified token_info back to the file
+    with open('token_info_refreshed.json', 'w') as json_file:
+        json.dump(token_info, json_file, indent=4)
+        
+    # Load existing token_info from the file
+    with open('token_info.json', 'r') as json_file:
+        token_info = json.load(json_file)
+
+    # Load refreshed token_info from the file
+    with open('token_info_refreshed.json', 'r') as refreshed_json_file:
+        refreshed_token_info = json.load(refreshed_json_file)
+
+    # Update the original token_info with the refreshed access_token
+    token_info['access_token'] = refreshed_token_info['access_token']
+
+    # Write the modified token_info back to the file
+    with open('token_info.json', 'w') as json_file:
+        json.dump(token_info, json_file, indent=4)
+        
+    return jsonify({'message': 'Token have been successfully refreshed'})
+if __name__ == '__main__':
+    app.run(debug=True)
