@@ -19,6 +19,12 @@ import msal
 import random
 import string 
 import base64
+from flask_apscheduler import APScheduler
+from email.message import EmailMessage
+from flask_mail import Mail ,Message
+import datatime
+
+
 
 app = Flask(__name__)
 CORS(app, origins="*", supports_credentials=True)
@@ -29,6 +35,9 @@ app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY')
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=1)
 app.config["JWT_REFRESH_TOKEN_EXPIRES"] = timedelta(days=30)
 jwt = JWTManager(app)
+scheduler = APScheduler()
+scheduler.init_app(app)
+scheduler.start()
 
 
 client = MongoClient(os.getenv('MONGODB_URL'))
@@ -37,6 +46,16 @@ db = client['AI_database']
 # google login 
 app.config["GOOGLE_OAUTH_CLIENT_ID"] = os.getenv('GOOGLE_OAUTH_CLIENT_ID')
 app.config["GOOGLE_OAUTH_CLIENT_SECRET"] = os.getenv('GOOGLE_OAUTH_CLIENT_SECRET')
+
+
+# email configuration 
+app.config['MAIL_SERVER']='smtp.gmail.com'
+app.config['MAIL_PORT'] = 465
+app.config['MAIL_USERNAME'] = os.getenv('YOUR_EMAIL_ADDRESS')
+app.config['MAIL_PASSWORD'] = os.getenv('YOUR_EMAIL_PASSWORD')
+app.config['MAIL_USE_TLS'] = False
+app.config['MAIL_USE_SSL'] = True
+mail = Mail(app) 
 
 google_blueprint = make_google_blueprint(
     client_id=os.getenv('GOOGLE_OAUTH_CLIENT_ID'),
@@ -166,7 +185,7 @@ def register():
         return jsonify({'message': 'User already exists'}), 400
 
     hashed_password = generate_password_hash(password)
-    chef_id = "AiChef"+ first_name.upper() + "-" + str(random.randint(1000,10000))
+    user_id = "AiChef"+ first_name.upper() + "-" + round((datetime.datetime.now().timestamp())*1000000)
     db.users.insert_one({
         'first_name': first_name,
         'last_name': last_name,
@@ -174,7 +193,7 @@ def register():
         'phone': phone,
         'email': email,
         'password': hashed_password,
-        'chef_id':chef_id
+        'user_id':user_id
     })
     
     return jsonify({'message': 'User registered successfully'}), 201
@@ -331,7 +350,103 @@ def create_id():
     return jsonify({"message":"chef id created succesffuly"}),200
 
 
+@app.route('/api/saveMenu',methods =['GET','POST'])
+
+def saveMenu():
+    
+    user_email = get_jwt_identity()
+    user =db.users.find_one({'email':user_email})
+    name = user['first_name'] +" " +user['last_name']
+    
+
+
+    data = request.get_json()
+    print(data)
+    meal = data['meal']
+    numberOfPeople = data['numberOfPeople']
+    mainDishes = data['mainDishes']
+    sideDishes = data['sideDishes']
+    cookingTime = data['cookingTime']
+    selectedEquipments = data['selectedEquipments']
+    selectedIngredients = data['selectedIngredients']
+    reminder = data['selectedDateTime']
+    newMainDish = data['newMainDish']
+    newSideDish = data['newSideDish']
+    skill = data['skill'],
+    beverages = data['beverages']
+    cuisine = data['cuisine']
+    desserts = data['desserts']
+    appetizers = data['appetizers']
+
+
+    
+    if meal =='dinner':
+        db.Menu.insert_one({
+            'meal':meal,
+            'mainDish':mainDishes,
+            'ingredients':selectedIngredients,
+            'sideDish':sideDishes,
+            'kitchen_equipements':selectedEquipments,
+            'no_of_people':numberOfPeople,
+            'cooking_time':cookingTime,
+            'reminder':reminder,
+            'newMainDish':newMainDish,
+            'newSideDish':newSideDish,
+            'skill':skill,
+            'beverages':beverages,
+            'cuisine':cuisine, 
+            'desserts' :desserts,
+            'appetizers':appetizers
+
+        })    
+    else:
+        db.Menu.insert_one({
+            'meal':meal,
+            'mainDish':mainDishes,
+            'ingredients':selectedIngredients,
+            'sideDish':sideDishes,
+            'kitchen_equipements':selectedEquipments,
+            'no_of_people':numberOfPeople,
+            'cooking_time':cookingTime,
+            'reminder':reminder,
+            'newMainDish':newMainDish,
+            'newSideDish':newSideDish,
+            'skill':skill,
+            'beverages':beverages,
+            'cuisine':cuisine
+        
+        })
+
+
+    reminder_time = reminder -timedelta(minutes =10)
+    scheduler.add_job(
+        id ='reminder',
+        func= send_reminder,
+        args = [user_email,meal,mainDishes,reminder],
+        trigger = 'date',
+        run_date = reminder_time
+
+    )
+ 
+    return jsonify({'Message':"Menu saved successfully "}),201
+
+def send_reminder(user_email,meal,mainDishes,reminder):
+    msg = Message(
+        'Hello',
+        sender = os.getenv('YOUR_EMAIL_ADDRESS'),
+        recipients =[user_email]
+
+    )
+    msg.body =f"Your Dish {meal} with main Dishes {mainDishes} is ready to cook in {reminder} minutes"
+    mail.send(msg)
+
+    
+
+
+
+
 # pipeline of data
+'''
 redirect_uri = 'http://localhost:3000/callback'
 
 def generate_random_string(length):
@@ -425,5 +540,7 @@ def refresh_token():
         json.dump(token_info, json_file, indent=4)
         
     return jsonify({'message': 'Token have been successfully refreshed'})
+
+'''
 if __name__ == '__main__':
     app.run(debug=True)
